@@ -11,31 +11,72 @@ from modulos.asistente_ia import generar_explicacion_renta
 
 st.set_page_config(page_title="DaddyBalance v1.0", layout="wide")
 
-st.title("👨‍💼 DaddyBalance: Asistente Inteligente de Operación Renta")
+st.title("👨‍💼 DaddyBalance: Asistente Inteligente de Contabilidad")
 
 # --- ESTILOS CSS ---
 st.markdown("""
     <style>
+    /* 1. Achicar el título principal de la App */
+    h1 {
+        font-size: 1.8rem !important;
+        padding-top: 0rem !important;
+        padding-bottom: 0rem;
+        margin-bottom: -10px !important; /* Reduce el espacio con lo que sigue */
+        font-weight: 700;
+    }
+
+    /* 2. Ajuste de Subtítulos (Subheadrs) para que se peguen arriba */
+    h3 {
+        margin-top: -15px !important;
+        padding-top: 0rem !important;
+        font-size: 1.2rem !important;
+        color: #f0f2f6;
+    }
+            
+    /* Contenedor principal de la métrica */
     [data-testid="stMetric"] {
         background-color: #1e2130;
         border: 1px solid #3e445b;
-        padding: 15px;
+        padding: 15px !important;
         border-radius: 12px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        min-height: 140px; 
+        min-height: 115px; 
         display: flex;
         flex-direction: column;
-        justify-content: center;
+        justify-content: flex-start !important; /* Alinea todo al tope */
+        gap: 0px !important; /* Elimina espacio entre título, valor y delta */
     }
+    
+    /* Título de la métrica */
     [data-testid="stMetricLabel"] {
         color: #a0aec0 !important;
         font-weight: bold;
+        margin-bottom: -5px !important; /* Acerca el título al valor */
+        line-height: 1.2 !important;
     }
+    
+    /* Valor numérico ($) */
     [data-testid="stMetricValue"] {
         color: #ffffff !important;
+        font-size: 1.8rem !important;
+        margin-bottom: -5px !important; /* Acerca el valor al texto de abajo */
+        line-height: 1 !important;
+    }
+
+    /* El texto inferior (Gasto Rechazado / Base Imponible) */
+    [data-testid="stMetricDelta"] {
+        margin-top: 0px !important;
+        padding-top: 0px !important;
+    }
+    
+    /* Ajuste para que el contenedor interno no centre los elementos */
+    [data-testid="stMetric"] > div {
+        width: 100%;
+        justify-content: flex-start !important;
     }
     </style>
     """, unsafe_allow_html=True)
+
 
 # --- NAVEGACIÓN ---
 st.sidebar.header("Menú de Navegación")
