@@ -11,6 +11,34 @@ from modulos.asistente_ia import generar_explicacion_renta
 
 st.set_page_config(page_title="DaddyBalance v1.0", layout="wide")
 
+# --- SISTEMA DE SEGURIDAD ---
+def check_password():
+    """Retorna True si el usuario ingresó la contraseña correcta."""
+    def password_entered():
+        if st.session_state["password"] == "DADDY2026": # <-- Puedes cambiar tu clave aquí
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.title("🔒 Acceso Restringido")
+        st.text_input("Ingrese la contraseña para usar DaddyBalance:", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.title("🔒 Acceso Restringido")
+        st.text_input("Ingrese la contraseña para usar DaddyBalance:", type="password", on_change=password_entered, key="password")
+        st.error("😕 Contraseña incorrecta")
+        return False
+    else:
+        return True
+
+if not check_password():
+    st.stop()
+
+# --- CONTINUACIÓN DEL CÓDIGO (SOLO SI LA CLAVE ES CORRECTA) ---
+
+
 st.title("👨‍💼 DaddyBalance: Asistente Inteligente de Contabilidad")
 
 # --- ESTILOS CSS ---
@@ -189,3 +217,5 @@ elif opcion == "Análisis de Renta":
                                file_name="Informe_RLI_DaddyBalance.txt")
         else:
             st.error("Error al procesar el archivo.")
+
+
