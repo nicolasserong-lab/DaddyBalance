@@ -1,4 +1,9 @@
 streamlit
 pandas
 openpyxl
+xlrd
 plotly
+openai
+groq
+pytest
+supabase
