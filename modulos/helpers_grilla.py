@@ -1,426 +1,299 @@
 """
-Módulo contable DaddyBalance: lectura, clasificación y validación de balances 8 columnas.
-
-Requisitos mínimos del Excel (Sprint 5 - documentación):
-- Obligatorio: una columna de cuenta (Cuenta, Nombre o equivalente).
-- Obligatorio: un par de movimientos o saldos:
-  - Débitos y Créditos, o
-  - Debe y Haber, o
-  - Deudor y Acreedor.
-- Opcional: Código (recomendado para clasificación por plan chileno).
-Si faltan cuenta o movimientos/saldos, procesar_balance_8_columnas devuelve mensaje de error.
+Helpers para grilla de balance: constantes, formato numérico, preparación de DF y mensajes de validación.
+Centraliza lógica duplicada entre Cargar Balance y Análisis de Renta.
 """
+__all__ = [
+    "preparar_df_para_grilla", "agregar_filas_resumen_balance", "df_grilla_para_display",
+    "fmt_entero", "altura_grilla", "mostrar_validacion_debe_haber", "mostrar_validacion_activo_pasivo",
+    "render_grilla_agrupada",
+]
 import pandas as pd
-import re
+import streamlit as st
 
-# Tildes para normalización consistente con nombres de columnas
-_REPLAZOS_TILDE = [("Á", "A"), ("É", "E"), ("Í", "I"), ("Ó", "O"), ("Ú", "U")]
+# Columnas internas (sin tildes) en orden estándar
+COLUMNAS_GRILLA_ORDEN = [
+    "CODIGO", "CUENTA", "DEBE", "HABER", "DEUDOR", "ACREEDOR",
+    "ACTIVO", "PASIVO", "PERDIDA", "GANANCIA",
+]
 
-
-# Mapa: nombre canónico -> conjuntos de nombres normalizados (entrada flexible Sprint 1)
-_ALIASES_COLUMNAS = {
-    "CODIGO": {"CODIGO", "COD", "CODIGO DE CUENTA", "NUMERO", "NRO", "NUMERO DE CUENTA", "CODIGO CUENTA"},
-    "CUENTA": {"CUENTA", "NOMBRE", "NOMBRE DE CUENTA", "NOMBRE CUENTA", "DENOMINACION"},
-    "DEBE": {"DEBE", "DEBITO"},
-    "HABER": {"HABER", "CREDITO"},
-    "DEBITOS": {"DEBITOS"},
-    "CREDITOS": {"CREDITOS"},
-    "DEUDOR": {"DEUDOR", "SALDO DEUDOR"},
-    "ACREEDOR": {"ACREEDOR", "SALDO ACREEDOR"},
-    "ACTIVO": {"ACTIVO"},
-    "PASIVO": {"PASIVO"},
-    "PERDIDA": {"PERDIDA", "PERDIDAS"},
-    "GANANCIA": {"GANANCIA", "GANANCIAS"},
+# Nombres para mostrar en la grilla (encabezados centrados)
+NOMBRES_GRILLA_DISPLAY = {
+    "CODIGO": "Código", "CUENTA": "Cuenta", "DEBE": "Debe", "HABER": "Haber",
+    "DEUDOR": "Deudor", "ACREEDOR": "Acreedor", "ACTIVO": "Activo", "PASIVO": "Pasivo",
+    "PERDIDA": "Pérdida", "GANANCIA": "Ganancia",
 }
 
-
-def normalizar_nombre(col):
-    s = str(col).strip().upper()
-    for viejo, nuevo in _REPLAZOS_TILDE:
-        s = s.replace(viejo, nuevo)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+ESTILO_ENCABEZADO_CENTRADO = [{"selector": "th", "props": [("text-align", "center")]}]
 
 
-def _aplicar_alias_columnas(df):
+def fmt_miles(val):
+    """Formatea valor para celda (miles con punto)."""
+    if pd.isna(val):
+        return ""
+    try:
+        return f"{int(float(val)):,.0f}".replace(",", ".")
+    except (ValueError, TypeError):
+        return str(val)
+
+
+def fmt_entero(n):
+    """Formatea entero para mensajes (ej. $ 1.234.567)."""
+    return f"{int(n):,.0f}".replace(",", ".")
+
+
+def altura_grilla(n_filas, alto_cabecera=36, alto_por_fila=26, min_altura=64, max_altura=420):
+    """Calcula altura del dataframe para st.dataframe."""
+    h = alto_cabecera + alto_por_fila * n_filas + 2
+    return max(min_altura, min(h, max_altura))
+
+
+def asegurar_debe_haber(df):
+    """Añade DEBE/HABER desde DEBITOS/CREDITOS si no existen. Modifica copia."""
+    df = df.copy()
+    if "DEBE" not in df.columns:
+        df["DEBE"] = df["DEBITOS"] if "DEBITOS" in df.columns else 0
+    if "HABER" not in df.columns:
+        df["HABER"] = df["CREDITOS"] if "CREDITOS" in df.columns else 0
+    return df
+
+
+def preparar_df_para_grilla(df):
+    """Devuelve DF solo con columnas de grilla en orden (con DEBE/HABER asegurados)."""
+    df = asegurar_debe_haber(df)
+    cols = [c for c in COLUMNAS_GRILLA_ORDEN if c in df.columns]
+    return df[cols].copy()
+
+
+def agregar_filas_resumen_balance(df_grilla):
     """
-    Renombra columnas según alias (Sprint 1: entrada flexible).
-    Cada columna normalizada se mapea al primer canónico que coincida.
+    Inserta filas SUBTOTALES (antes de Utilidad) y TOTALES (después de Utilidad).
+    Estructura final: [detalle] + [SUBTOTALES] + [Utilidad/Pérdida del Ejercicio] + [TOTALES].
     """
-    if df is None or df.empty:
+    if df_grilla.empty:
+        return df_grilla.copy()
+
+    cuenta_col = "CUENTA" if "CUENTA" in df_grilla.columns else None
+    if not cuenta_col:
+        return df_grilla.copy()
+
+    # Identificar fila de resultado (última)
+    mask_resultado = df_grilla[cuenta_col].astype(str).str.contains(
+        "Utilidad del Ejercicio|Pérdida del Ejercicio", case=False, na=False
+    )
+    if not mask_resultado.any():
+        return df_grilla.copy()
+
+    df_detalle = df_grilla[~mask_resultado].copy()
+    df_resultado = df_grilla[mask_resultado].copy()
+
+    num_cols = [c for c in df_grilla.columns if c not in ("CODIGO", "CUENTA")]
+    subtotales = df_detalle[num_cols].sum().astype(int)
+    totales = subtotales + df_resultado[num_cols].iloc[0]
+
+    # Importante (hoja de trabajo 8 columnas):
+    # Los "SALDOS" (DEUDOR/ACREEDOR) deben cuadrar entre sí.
+    # La utilidad/pérdida del ejercicio es un derivado del Estado de Resultados y se refleja
+    # en Estado Patrimonial (Activo/Pasivo), no debe alterar el total de saldos.
+    for c in ("DEUDOR", "ACREEDOR"):
+        if c in totales.index and c in subtotales.index:
+            totales[c] = int(subtotales[c])
+
+    col_cod = "CODIGO" if "CODIGO" in df_grilla.columns else None
+    fila_sub = {c: 0 for c in df_grilla.columns}
+    fila_sub[cuenta_col] = "SUBTOTALES"
+    if col_cod:
+        fila_sub[col_cod] = ""
+    for c in num_cols:
+        fila_sub[c] = int(subtotales[c])
+
+    fila_tot = {c: 0 for c in df_grilla.columns}
+    fila_tot[cuenta_col] = "TOTALES"
+    if col_cod:
+        fila_tot[col_cod] = ""
+    for c in num_cols:
+        fila_tot[c] = int(totales[c])
+
+    return pd.concat([
+        df_detalle,
+        pd.DataFrame([fila_sub]),
+        df_resultado.reset_index(drop=True),
+        pd.DataFrame([fila_tot]),
+    ], ignore_index=True)
+
+
+def df_grilla_para_display(df_grilla):
+    """
+    Renombra columnas a nombres display y devuelve (df_show, formato_numericas, col_codigo).
+    formato_numericas es dict col -> fmt_miles para .style.format().
+    """
+    renombrar = {c: NOMBRES_GRILLA_DISPLAY[c] for c in df_grilla.columns if c in NOMBRES_GRILLA_DISPLAY}
+    df_show = df_grilla.rename(columns=renombrar)
+    col_codigo = "Código" if "Código" in df_show.columns else None
+    numericas = df_show.select_dtypes(include=["number"]).columns
+    cols_fmt = [c for c in numericas if c != col_codigo]
+    formato = {c: fmt_miles for c in cols_fmt}
+    return df_show, formato, col_codigo
+
+
+def _filtrar_filas_resumen(df):
+    """
+    Remueve filas de resumen agregadas solo para display/exportación.
+    Evita que validaciones (sumatorias) cuenten SUBTOTALES/TOTALES.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
         return df
-    renombrar = {}
-    usados = set()
-    for col in df.columns:
-        norm = normalizar_nombre(col)
-        for canonico, aliases in _ALIASES_COLUMNAS.items():
-            if norm in aliases and canonico not in usados:
-                renombrar[col] = canonico
-                usados.add(canonico)
-                break
-        else:
-            renombrar[col] = col
-    return df.rename(columns=renombrar)
+    for col in ("CUENTA", "Cuenta"):
+        if col in df.columns:
+            s = df[col].astype(str).str.strip().str.upper()
+            return df[~s.isin({"SUBTOTALES", "TOTALES"})]
+    return df
 
 
-def _tiene_movimientos_o_saldos(df):
-    """True si hay al menos DEBE+HABER, o DEBITOS+CREDITOS, o DEUDOR+ACREEDOR."""
-    c = df.columns
-    return (
-        ("DEBE" in c and "HABER" in c)
-        or ("DEBITOS" in c and "CREDITOS" in c)
-        or ("DEUDOR" in c and "ACREEDOR" in c)
+def mostrar_validacion_debe_haber(df, validar_fn, prefijo="$ "):
+    """Ejecuta validar_debe_haber_cuadra y muestra st.success o st.error."""
+    df_val = _filtrar_filas_resumen(df)
+    cuadra, suma_d, suma_h = validar_fn(df_val)
+    if cuadra:
+        st.success(f"✅ Balance de comprobación: Debe = Haber ({prefijo}{fmt_entero(suma_d)})")
+    else:
+        diff = abs(suma_d - suma_h)
+        st.error(
+            f"⚠️ Balance de comprobación no cuadra: Debe {prefijo}{fmt_entero(suma_d)} | "
+            f"Haber {prefijo}{fmt_entero(suma_h)} | Diferencia {prefijo}{fmt_entero(diff)}"
+        )
+
+
+def mostrar_validacion_activo_pasivo(df, validar_fn, prefijo="$ ", titulo_ok="Ecuación contable", titulo_error="Ecuación contable no cuadra"):
+    """Ejecuta validar_activo_igual_pasivo y muestra st.success o st.error."""
+    df_val = _filtrar_filas_resumen(df)
+    suma_a, suma_p, cuadra = validar_fn(df_val)
+    if cuadra:
+        st.success(f"✅ {titulo_ok}: Activo = Pasivo ({prefijo}{fmt_entero(suma_a)})")
+    else:
+        diff = abs(suma_a - suma_p)
+        st.error(
+            f"⚠️ {titulo_error}: Activo {prefijo}{fmt_entero(suma_a)} | "
+            f"Pasivo {prefijo}{fmt_entero(suma_p)} | Diferencia {prefijo}{fmt_entero(diff)}"
+        )
+
+
+# Estructura de encabezados agrupados (inspirado en balance contable estándar)
+# (grupo, subcolumnas) donde grupo es el encabezado padre y subcolumnas son las columnas del DF
+ENCABEZADOS_AGRUPADOS = [
+    ("N°", ["Código"]),
+    ("Cuentas", ["Cuenta"]),
+    ("Sumas", ["Debe", "Haber"]),
+    ("Saldos", ["Deudor", "Acreedor"]),
+    ("Estado Patrimonial", ["Activo", "Pasivo"]),
+    ("Estado de Resultados", ["Pérdida", "Ganancia"]),
+]
+
+
+def _formatear_celda(val, col, formato, col_codigo):
+    """Formatea valor de celda según columna."""
+    if pd.isna(val):
+        return ""
+    if col in formato:
+        return formato[col](val)
+    if col in (col_codigo, "Código"):
+        try:
+            return str(int(float(val))) if isinstance(val, (int, float)) else str(val)
+        except (ValueError, TypeError):
+            return str(val)
+    return fmt_miles(val)
+
+
+def render_grilla_agrupada(df_show, formato, max_height_px=550, codigos_rechazo=None, col_codigo="Código"):
+    """
+    Renderiza la grilla como tabla HTML con encabezados agrupados en dos filas.
+    Mantiene el diseño oscuro de la app. Centra todo el texto.
+    codigos_rechazo: set de códigos a resaltar en rojo (Análisis Renta).
+    """
+    # Orden de columnas según ENCABEZADOS_AGRUPADOS
+    col_order = []
+    for _, subcols in ENCABEZADOS_AGRUPADOS:
+        for c in subcols:
+            if c in df_show.columns:
+                col_order.append(c)
+    if not col_order:
+        col_order = list(df_show.columns)
+    df_ordered = df_show[[c for c in col_order if c in df_show.columns]].copy()
+
+    # Estilo: compacto, colores refinados
+    header_style = (
+        "background: linear-gradient(180deg, #1e3a5f 0%, #152a45 100%); color: #f8fafc; "
+        "font-weight: 700; font-size: 0.75rem; letter-spacing: 0.2px; "
+        "text-align: center; padding: 5px 8px; border: 1px solid #2d4a6f; "
+        "vertical-align: middle;"
+    )
+    subheader_style = (
+        "background: #243b53; color: #cbd5e1; font-weight: 600; font-size: 0.72rem; "
+        "text-align: center; padding: 5px 8px; border: 1px solid #334155; "
+        "vertical-align: middle;"
     )
 
-
-def _mensaje_falta_columnas(df):
-    """Mensaje claro cuando falta el mínimo obligatorio (Sprint 1)."""
-    if "CUENTA" not in df.columns:
-        return "Error: No se encontró columna de cuenta. Debe existir una columna 'Cuenta' o 'Nombre' (o equivalente)."
-    if not _tiene_movimientos_o_saldos(df):
-        return (
-            "Error: No se encontraron columnas de movimientos ni saldos. "
-            "Debe haber Débitos/Créditos, o Debe/Haber, o Deudor/Acreedor (o equivalentes)."
-        )
-    return None
-
-
-def limpiar_monto(valor):
-    if pd.isna(valor):
-        return 0
-    # Si ya es numérico (Excel suele traer float), convertir a int sin tocar string (evitar que 5000000.0 -> "5000000.0" -> 50000000)
-    if isinstance(valor, (int, float)):
-        return int(round(float(valor)))
-    valor = str(valor).strip()
-    valor = re.sub(r"[^\d\-.,]", "", valor)
-    if not valor or valor == "-":
-        return 0
-    neg = valor.startswith("-")
-    if neg:
-        valor = valor[1:]
-    if "." in valor and "," in valor:
-        if valor.rfind(",") > valor.rfind("."):
-            valor = valor.replace(".", "").replace(",", ".")
+    # Fila 1: grupos (rowspan para N° y Cuentas, colspan para el resto)
+    th_grupos = []
+    for grupo, subcols in ENCABEZADOS_AGRUPADOS:
+        presentes = [c for c in subcols if c in df_ordered.columns]
+        if not presentes:
+            continue
+        if len(presentes) == 1:
+            th_grupos.append(f'<th rowspan="2" style="{header_style}">{grupo}</th>')
         else:
-            valor = valor.replace(",", "")
-    elif "," in valor:
-        partes = valor.split(",")
-        if len(partes) == 2 and len(partes[1]) <= 2:
-            valor = partes[0] + "." + partes[1]
+            th_grupos.append(f'<th colspan="{len(presentes)}" style="{header_style}">{grupo}</th>')
+
+    # Fila 2: subencabezados (solo para grupos con >1 columna; N° y Cuentas ya ocupan con rowspan)
+    th_sub = []
+    for _, subcols in ENCABEZADOS_AGRUPADOS:
+        if len(subcols) > 1:
+            for c in subcols:
+                if c in df_ordered.columns:
+                    th_sub.append(f'<th style="{subheader_style}">{c}</th>')
+
+    # Filas de datos (con estilos para SUBTOTALES, Utilidad, TOTALES) - filas ajustadas con más altura
+    cuenta_col = "Cuenta" if "Cuenta" in df_ordered.columns else None
+    filas_html = []
+    for idx, row in df_ordered.iterrows():
+        cuenta_val = str(row.get(cuenta_col, "")) if cuenta_col else ""
+        if cuenta_val == "SUBTOTALES":
+            row_style = "background: linear-gradient(180deg, #1e3a5f 0%, #152a45 100%); font-weight: 700; border-top: 2px solid rgba(34, 197, 94, 0.4);"
+        elif cuenta_val == "TOTALES":
+            row_style = "background: linear-gradient(180deg, #1e3a5f 0%, #152a45 100%); font-weight: 700;"
+        elif "Utilidad del Ejercicio" in cuenta_val or "Pérdida del Ejercicio" in cuenta_val:
+            row_style = "background: #243b53; font-weight: 600;"
         else:
-            valor = valor.replace(",", "")
-    else:
-        valor = valor.replace(".", "")
-    try:
-        n = int(round(float(valor)))
-        return -n if neg else n
-    except ValueError:
-        return 0
+            row_style = "background: #1e293b;" if idx % 2 == 0 else "background: #0f172a;"
 
+        cells = []
+        for col in df_ordered.columns:
+            val = row[col]
+            txt = _formatear_celda(val, col, formato, col_codigo)
+            extra_style = ""
+            if col == col_codigo and codigos_rechazo and txt and str(txt) in codigos_rechazo:
+                extra_style = "background-color: rgba(239, 68, 68, 0.15); border-left: 4px solid #ef4444;"
+            cell_style = f"{row_style} text-align: center; padding: 5px 8px; border: 1px solid #334155; color: #f1f5f9; font-size: 0.7rem; font-variant-numeric: tabular-nums; {extra_style}"
+            cells.append(f'<td style="{cell_style}">{txt}</td>')
+        filas_html.append("<tr>" + "".join(cells) + "</tr>")
 
-def _nombre_columna_codigo(columnas):
-    """Devuelve el nombre real de la columna que normaliza a CODIGO, o None."""
-    for c in columnas:
-        if normalizar_nombre(c) == "CODIGO":
-            return c
-    return None
-
-
-def procesar_balance_8_columnas(archivo):
+    html = f"""
+    <div class="grilla-balance-container" style="
+        margin-bottom: 0.6rem;
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid #334155;
+        box-shadow: 0 2px 16px rgba(0,0,0,0.3);
+        max-height: {max_height_px}px;
+        overflow-y: auto;
+        font-size: 90%;
+    ">
+    <table style="width: 100%; border-collapse: collapse; font-family: 'Plus Jakarta Sans', sans-serif;">
+        <thead>
+            <tr>{''.join(th_grupos)}</tr>
+            <tr>{''.join(th_sub)}</tr>
+        </thead>
+        <tbody>{''.join(filas_html)}</tbody>
+    </table>
+    </div>
     """
-    Lee y normaliza un balance de 8 columnas desde Excel.
-    Mínimo: columna Cuenta (o Nombre) + Débitos/Créditos, o Debe/Haber, o Deudor/Acreedor.
-    Si el archivo tiene varias hojas, usa la primera que tenga cuenta y movimientos/saldos (detección automática).
-    Si hay varias filas por cuenta (movimientos), agrupa y suma (Sprint 3).
-    Retorna un DataFrame limpio o un str con mensaje de error.
-    """
-    if archivo is None:
-        return "Error: No se proporcionó archivo."
-
-    try:
-        xl = pd.ExcelFile(archivo)
-    except Exception as e:
-        return f"Error al leer Excel: {type(e).__name__} — {str(e)}"
-
-    if not xl.sheet_names:
-        return "Error: El archivo no contiene hojas."
-
-    df = None
-    ultimo_error = None
-
-    for sheet_name in xl.sheet_names:
-        try:
-            hoja = xl.parse(sheet_name=sheet_name)
-        except Exception:
-            continue
-        if hoja.empty:
-            continue
-        # Aplicar alias y normalizar igual que más abajo
-        hoja = _aplicar_alias_columnas(hoja)
-        hoja.columns = [normalizar_nombre(c) for c in hoja.columns]
-        hoja = hoja.loc[:, ~hoja.columns.duplicated(keep="first")]
-        msg = _mensaje_falta_columnas(hoja)
-        if msg is None:
-            df = hoja
-            break
-        ultimo_error = msg
-
-    if df is None:
-        return (
-            ultimo_error
-            if ultimo_error
-            else "Error: En ninguna hoja del archivo se encontraron los datos mínimos requeridos "
-            "(columna de cuenta y Débitos/Créditos, o Debe/Haber, o Deudor/Acreedor)."
-        )
-
-    if df.empty:
-        return "Error: El archivo está vacío o no tiene filas."
-
-    # Eliminar columnas duplicadas (mismo nombre): quedarse con la primera (ya hecho en el bucle)
-    df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-    if "CUENTA" not in df.columns:
-        return "Error: No se encontró columna 'CUENTA'. Verifique el formato del balance."
-
-    # Filtrar filas de totales/resumen (se recalculará Utilidad/Pérdida del Ejercicio)
-    palabras_filtro = ["TOTAL", "UTILIDAD DEL EJERCICIO", "PERDIDA DEL EJERCICIO", "RESULTADO"]
-
-    def _sin_tilde(s):
-        s = str(s).strip().upper()
-        for v, n in _REPLAZOS_TILDE:
-            s = s.replace(v, n)
-        return s
-
-    mask = df["CUENTA"].apply(lambda x: not any(p in _sin_tilde(x) for p in palabras_filtro))
-    df = df[mask]
-
-    if df.empty:
-        return "Error: No quedaron filas de detalle después del filtro (solo totales)."
-
-    # Limpiar columnas monetarias
-    columnas_dinero = [
-        "DEUDOR", "ACREEDOR", "ACTIVO", "PASIVO", "PERDIDA", "GANANCIA",
-        "DEBITOS", "CREDITOS", "DEBE", "HABER",
-    ]
-    for col in columnas_dinero:
-        if col in df.columns:
-            df[col] = df[col].apply(limpiar_monto)
-
-    # Sprint 3: si hay varias filas por misma cuenta (movimientos), agrupar y sumar movimientos
-    group_cols = ["CODIGO", "CUENTA"] if "CODIGO" in df.columns else ["CUENTA"]
-    if "CODIGO" in df.columns:
-        df["CODIGO"] = df["CODIGO"].fillna(0)
-    if df.duplicated(subset=group_cols).any():
-        cols_sum = [
-            c for c in columnas_dinero
-            if c in df.columns
-        ]
-        if cols_sum:
-            df = df.groupby(group_cols, dropna=False)[cols_sum].sum().reset_index()
-
-    # Calcular DEUDOR y ACREEDOR desde movimientos cuando existan (balance correcto 8 columnas)
-    if "DEBITOS" in df.columns and "CREDITOS" in df.columns:
-        de = df["DEBITOS"].astype(int)
-        cr = df["CREDITOS"].astype(int)
-        if "DEUDOR" not in df.columns:
-            df["DEUDOR"] = (de - cr).clip(lower=0)
-        if "ACREEDOR" not in df.columns:
-            df["ACREEDOR"] = (cr - de).clip(lower=0)
-    elif "DEBE" in df.columns and "HABER" in df.columns:
-        de = df["DEBE"].astype(int)
-        ha = df["HABER"].astype(int)
-        if "DEUDOR" not in df.columns:
-            df["DEUDOR"] = (de - ha).clip(lower=0)
-        if "ACREEDOR" not in df.columns:
-            df["ACREEDOR"] = (ha - de).clip(lower=0)
-    # Si no hay columnas de movimiento, DEUDOR/ACREEDOR quedan como vienen del Excel (ya limpiados)
-
-    return df
-
-
-def combinar_balances(lista_df):
-    """
-    Combina varios balances ya procesados en uno solo (Sprint 1: carga múltiple).
-    Agrupa por cuenta (CODIGO + CUENTA, o solo CUENTA) y suma columnas numéricas.
-    Retorna un DataFrame o str con mensaje de error.
-    """
-    if not lista_df:
-        return "Error: No hay datos para combinar."
-    lista_df = [df for df in lista_df if isinstance(df, pd.DataFrame) and not df.empty]
-    if not lista_df:
-        return "Error: Ningún archivo válido para combinar."
-
-    combined = pd.concat(lista_df, ignore_index=True)
-
-    columnas_dinero = [
-        "DEUDOR", "ACREEDOR", "ACTIVO", "PASIVO", "PERDIDA", "GANANCIA",
-        "DEBITOS", "CREDITOS", "DEBE", "HABER",
-    ]
-    cols_num = [c for c in columnas_dinero if c in combined.columns]
-    for c in cols_num:
-        combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0).astype(int)
-
-    if "CODIGO" in combined.columns:
-        group_cols = ["CODIGO", "CUENTA"]
-        combined["CODIGO"] = combined["CODIGO"].fillna(0)
-    else:
-        group_cols = ["CUENTA"]
-
-    combined = combined.groupby(group_cols, dropna=False)[cols_num].sum().reset_index()
-    return combined
-
-
-from modulos.config_renta import get_patrones_gastos_rechazados, regex_gastos_rechazados
-
-
-def detectar_gastos_rechazados(df, patrones=None):
-    """
-    Filtra las filas del balance cuya cuenta coincide con los patrones de gastos rechazados.
-    patrones: lista de strings (ej. ["MULTA", "INTERESES MORATORIOS"]); si es None, se usa
-    la configuración de .streamlit/secrets.toml (GASTOS_RECHAZADOS) o el valor por defecto.
-    """
-    if "CUENTA" not in df.columns:
-        return pd.DataFrame()
-    patron_regex = regex_gastos_rechazados(patrones)
-    if not patron_regex:
-        return pd.DataFrame()
-    return df[df["CUENTA"].astype(str).str.upper().str.contains(patron_regex, na=False)]
-
-def validar_debe_haber_cuadra(df):
-    """
-    Valida que sum(DEBE) == sum(HABER) (balance de comprobación).
-    Usa columnas DEBE/HABER o DEBITOS/CREDITOS. Retorna (cuadra, suma_debe, suma_haber).
-    """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return True, 0, 0
-    if "DEBE" in df.columns and "HABER" in df.columns:
-        s_debe = int(df["DEBE"].sum())
-        s_haber = int(df["HABER"].sum())
-        return s_debe == s_haber, s_debe, s_haber
-    if "DEBITOS" in df.columns and "CREDITOS" in df.columns:
-        s_debe = int(df["DEBITOS"].sum())
-        s_haber = int(df["CREDITOS"].sum())
-        return s_debe == s_haber, s_debe, s_haber
-    return True, 0, 0
-
-
-def balance_8_columnas_para_display(df):
-    """
-    Clasifica según plan de cuentas chileno estándar (Sprint 2):
-      1 → Activo (deudor)
-      2 → Pasivo (acreedor)
-      3 → Patrimonio (acreedor, en columna Pasivo para cuadratura)
-      4 → Ingresos → Ganancia (acreedor)
-      5 → Costos → Pérdida (deudor)
-      6 → Gastos → Pérdida (deudor)
-      7 → Otros resultados → Ganancia (acreedor) por defecto
-      8 → Cuentas de orden → no afecta resultado (no suma a Pérdida ni Ganancia)
-    No modifica DEUDOR/ACREEDOR ni las filas Utilidad/Pérdida del Ejercicio.
-    """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    col_cod = _nombre_columna_codigo(df.columns)
-    if not col_cod:
-        return df
-    if "CUENTA" not in df.columns or "DEUDOR" not in df.columns or "ACREEDOR" not in df.columns:
-        return df
-    df = df.copy()
-    for c in ["ACTIVO", "PASIVO", "PERDIDA", "GANANCIA"]:
-        if c not in df.columns:
-            df[c] = 0
-
-    for i in df.index:
-        cuenta_val = str(df.at[i, "CUENTA"]).strip().lower()
-        if cuenta_val in ("utilidad del ejercicio", "perdida del ejercicio"):
-            continue
-        cod = df.at[i, col_cod]
-        try:
-            primera = str(int(float(cod)))[0] if pd.notna(cod) and str(cod).strip() else ""
-        except (ValueError, TypeError):
-            primera = ""
-
-        deudor = int(df.at[i, "DEUDOR"]) if pd.notna(df.at[i, "DEUDOR"]) else 0
-        acreedor = int(df.at[i, "ACREEDOR"]) if pd.notna(df.at[i, "ACREEDOR"]) else 0
-
-        df.at[i, "ACTIVO"] = 0
-        df.at[i, "PASIVO"] = 0
-        df.at[i, "PERDIDA"] = 0
-        df.at[i, "GANANCIA"] = 0
-
-        if primera == "1":
-            df.at[i, "ACTIVO"] = deudor
-        elif primera == "2":
-            df.at[i, "PASIVO"] = acreedor
-        elif primera == "3":
-            df.at[i, "PASIVO"] = acreedor
-        elif primera == "4":
-            df.at[i, "GANANCIA"] = acreedor
-        elif primera in ("5", "6"):
-            df.at[i, "PERDIDA"] = deudor
-        elif primera == "7":
-            df.at[i, "GANANCIA"] = acreedor
-        # 8 = cuentas de orden: no afecta resultado (queda 0 en PERDIDA y GANANCIA)
-
-    return df
-
-
-def validar_activo_igual_pasivo(df):
-    """
-    Comprueba que Activo = Pasivo + Patrimonio (ecuación contable).
-    En balance 8 columnas: suma(ACTIVO) debe igualar suma(PASIVO).
-    Retorna (suma_activo, suma_pasivo, cuadra).
-    """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return 0, 0, True
-    suma_activo = int(df["ACTIVO"].sum()) if "ACTIVO" in df.columns else 0
-    suma_pasivo = int(df["PASIVO"].sum()) if "PASIVO" in df.columns else 0
-    cuadra = suma_activo == suma_pasivo
-    return suma_activo, suma_pasivo, cuadra
-
-
-def validar_y_calcular_resultado(df):
-    """
-    Calcula UTILIDAD DEL EJERCICIO = SUM(GANANCIA) - SUM(PERDIDA) (lógica contable chilena).
-    Inserta la fila del resultado y retorna (DataFrame actualizado, monto_utilidad).
-    Columnas faltantes se tratan como 0. No usa DEUDOR/ACREEDOR para el cálculo.
-    """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df, 0
-
-    columnas = df.columns
-    sum_ganancia = df["GANANCIA"].sum() if "GANANCIA" in columnas else 0
-    sum_perdida = df["PERDIDA"].sum() if "PERDIDA" in columnas else 0
-    utilidad = float(sum_ganancia - sum_perdida)
-
-    nueva_fila = {col: 0 for col in df.columns}
-    col_cod = _nombre_columna_codigo(columnas)
-
-    # Hoja de trabajo / Balance 8 columnas:
-    # - La fila de "Utilidad/Pérdida del Ejercicio" funciona como cierre:
-    #   - Cuadra Estado de Resultados (Pérdida vs Ganancia)
-    #   - Traspasa el resultado al Estado Patrimonial (Activo/Pasivo/Patrimonio)
-    # - No representa un saldo (DEUDOR/ACREEDOR) propio, por eso quedan en 0.
-    if utilidad > 0:
-        # Utilidad: se registra en PÉRDIDA (deudor) para cuadrar ER y en PASIVO (acreedor/patrimonio) para cuadrar EP.
-        nueva_fila["CUENTA"] = "Utilidad del Ejercicio"
-        if "PERDIDA" in columnas:
-            nueva_fila["PERDIDA"] = int(round(utilidad))
-        if "PASIVO" in columnas:
-            nueva_fila["PASIVO"] = int(round(utilidad))
-    elif utilidad < 0:
-        # Pérdida: se registra en GANANCIA (acreedor) para cuadrar ER y en ACTIVO (deudor) para cuadrar EP.
-        perdida = int(round(abs(utilidad)))
-        nueva_fila["CUENTA"] = "Pérdida del Ejercicio"
-        if "GANANCIA" in columnas:
-            nueva_fila["GANANCIA"] = perdida
-        if "ACTIVO" in columnas:
-            nueva_fila["ACTIVO"] = perdida
-    else:
-        # Resultado cero: dejar fila informativa sin impactos.
-        nueva_fila["CUENTA"] = "Utilidad del Ejercicio"
-
-    if col_cod:
-        nueva_fila[col_cod] = 0
-
-    df = pd.concat([df, pd.DataFrame([nueva_fila])], ignore_index=True)
-    return df, utilidad
+    return html
