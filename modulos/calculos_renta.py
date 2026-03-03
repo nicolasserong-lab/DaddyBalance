@@ -1,15 +1,19 @@
-def calcular_rli_basica(df, regimen="Propyme General (14 D3)"):
+from modulos.lector_contable import detectar_gastos_rechazados
 
+
+def calcular_rli_basica(df, regimen="Propyme General (14 D3)", patrones=None):
+    """
+    patrones: lista de patrones de gastos rechazados; si es None, se usa config (secrets o default).
+    """
     total_perdida = df['PERDIDA'].sum() if 'PERDIDA' in df.columns else 0
     total_ganancia = df['GANANCIA'].sum() if 'GANANCIA' in df.columns else 0
 
     resultado_contable = total_ganancia - total_perdida
 
-    # Gastos rechazados (si existe columna)
+    gastos_rechazados = detectar_gastos_rechazados(df, patrones=patrones)
     total_agregados = 0
-    if 'PERDIDA' in df.columns and 'CUENTA' in df.columns:
-        gastos_rechazados = df[df['CUENTA'].str.contains('MULTA|INTERESES', case=False, na=False)]
-        total_agregados = gastos_rechazados['PERDIDA'].sum()
+    if not gastos_rechazados.empty and "PERDIDA" in gastos_rechazados.columns:
+        total_agregados = gastos_rechazados["PERDIDA"].sum()
 
     rli_estimada = resultado_contable + total_agregados
 
