@@ -1,14 +1,18 @@
 import io
+import os
+import re
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
 # Importamos las funciones de nuestros módulos
-#from modulos.lector_contable import procesar_balance_8_columnas, detectar_gastos_rechazados
 from modulos.calculos_renta import calcular_rli_basica 
 from modulos.asistente_ia import generar_explicacion_renta 
 from modulos.lector_contable import (
     procesar_balance_8_columnas,
+    combinar_balances,
     detectar_gastos_rechazados,
     validar_y_calcular_resultado,
     balance_8_columnas_para_display,
@@ -16,14 +20,44 @@ from modulos.lector_contable import (
     validar_activo_igual_pasivo,
     _nombre_columna_codigo,
 )
+from modulos.helpers_grilla import (
+    preparar_df_para_grilla,
+    agregar_filas_resumen_balance,
+    df_grilla_para_display,
+    fmt_entero,
+    altura_grilla,
+    mostrar_validacion_debe_haber,
+    mostrar_validacion_activo_pasivo,
+    render_grilla_agrupada,
+)
+from modulos.validaciones_carga import (
+    validar_formato_archivo,
+    validar_archivo_tiene_contenido,
+    validar_estructura_8_columnas,
+    get_solucion_validacion_basica,
+    ESTRUCTURA_VALIDA,
+)
+from modulos import db
 
 # Configuración de página
 st.set_page_config(page_title="DaddyBalance v1.0", layout="wide", initial_sidebar_state="expanded")
 
 # --- SISTEMA DE SEGURIDAD ---
+# La contraseña se configura en .streamlit/secrets.toml como APP_PASSWORD (nunca en el código).
 def check_password():
+    password_esperada = st.secrets.get("APP_PASSWORD")
+    if not password_esperada or not str(password_esperada).strip():
+        st.title("🔒 Acceso Restringido")
+        st.error(
+            "No está configurada la contraseña de acceso. "
+            "Agregue **APP_PASSWORD** en el archivo `.streamlit/secrets.toml`."
+        )
+        st.markdown("---")
+        st.code("APP_PASSWORD = \"tu_contraseña_secreta\"", language="toml")
+        return False
+
     def password_entered():
-        if st.session_state["password"] == "DADDY2026": 
+        if st.session_state["password"] == str(password_esperada).strip():
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
@@ -44,13 +78,21 @@ if not check_password():
     st.stop()
 
 # --- ESTILOS CSS NIVEL DIOS ---
+# Tema oscuro forzado para que se vea igual en todos los notebooks/entornos
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Plus Jakarta Sans', sans-serif;
-        background-color: #0b0e14;
+
+    /* Raíz y cuerpo: fondo oscuro siempre */
+    html, body, .main .block-container, [data-testid="stAppViewContainer"] {
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        background-color: #0b0e14 !important;
+    }
+    [class*="css"] {
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+    }
+    .stApp {
+        background-color: #0b0e14 !important;
     }
 
     .hero-title {
@@ -118,18 +160,99 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.05) !important;
     }
 
+    /* Combo Panel de Control: fondo oscuro y texto claro en todos los entornos */
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] > div,
+    [data-testid="stSidebar"] .stSelectbox > div > div,
+    div[data-testid="stSelectbox"] div {
+        background-color: #1e293b !important;
+        color: #f8fafc !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] label,
+    [data-testid="stSidebar"] .stSelectbox label {
+        color: #94a3b8 !important;
+    }
+
+    /* Área de carga de archivos (Cargar Balance / Análisis): fondo oscuro */
+    section[data-testid="stFileUploader"] {
+        background-color: #1e293b !important;
+        border-radius: 12px !important;
+    }
+    section[data-testid="stFileUploader"] > div,
+    [data-testid="stFileUploader"] section {
+        background-color: #1e293b !important;
+        border-color: rgba(255,255,255,0.1) !important;
+    }
+    [data-testid="stFileUploader"] label {
+        color: #e2e8f0 !important;
+    }
+
     .stDataFrame {
         border-radius: 20px !important;
-        overflow: visible !important;
+        overflow: hidden !important;
+        position: relative !important;
+        border: 1px solid rgba(255, 255, 255, 0.12) !important;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2) !important;
     }
     div[data-testid="stDataFrame"] {
-        padding-bottom: 16px !important;
+        padding-bottom: 0 !important;
+        overflow: hidden !important;
+        position: relative !important;
+        border: 1px solid rgba(255, 255, 255, 0.12) !important;
+        border-radius: 12px !important;
     }
     div[data-testid="stDataFrame"] > div {
-        overflow: hidden;
-        border-radius: 12px;
+        overflow: hidden !important;
+        border-radius: 12px !important;
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    }
+    div[data-testid="stDataFrame"] th, div[data-testid="stDataFrame"] thead th {
+        text-align: center !important;
+    }
+    /* Borde inferior y derecho de la tabla: última fila y última celda */
+    div[data-testid="stDataFrame"] tbody tr:last-child td {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.15) !important;
+    }
+    div[data-testid="stDataFrame"] td:last-child,
+    div[data-testid="stDataFrame"] th:last-child {
+        border-right: 1px solid rgba(255, 255, 255, 0.15) !important;
+    }
+    /* Bloque Análisis Renta: contenedor y columnas alineadas */
+    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) { gap: 0.5rem; }
+    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) [data-testid="column"] {
+        min-height: 88px; display: flex; flex-direction: column;
+    }
+    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stSelectbox label,
+    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stFileUploader label {
+        font-size: 0.9rem !important; font-weight: 600 !important; color: #94a3b8 !important; margin-bottom: 0.35rem !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stFileUploader [data-testid="stFileUploader"] section {
+        padding: 0.85rem 1.1rem !important; min-height: 68px !important; border-radius: 12px;
+    }
+    div[data-testid="stDataFrame"] td:last-child,
+    div[data-testid="stDataFrame"] th:last-child {
+        border-right: 1px solid rgba(255, 255, 255, 0.15) !important;
+    }
+    /* Franja bajo la última fila: mismo color que el borde para cerrar visualmente la grilla */
+    div[data-testid="stDataFrame"]::after {
+        content: "";
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: rgba(255, 255, 255, 0.12);
+        pointer-events: none;
     }
     
+    /* Grilla balance: scrollbar y espaciado para evitar traslape con mensajes */
+    .grilla-balance-container {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(148,163,184,0.4) transparent;
+    }
+    .grilla-balance-container::-webkit-scrollbar { width: 8px; height: 8px; }
+    .grilla-balance-container::-webkit-scrollbar-track { background: rgba(15,23,42,0.5); }
+    .grilla-balance-container::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.4); border-radius: 4px; }
+
     /* Centrar icono DaddyBalance */
     .sidebar-logo {
         display: flex;
@@ -156,7 +279,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### Panel de Control")
-    opcion = st.selectbox("Seleccione Función", ["Inicio", "Cargar Balance", "Análisis de Renta"], label_visibility="collapsed")
+    opcion = st.selectbox("Seleccione Función", ["Inicio", "Cargar Balance", "Análisis de Renta", "Ver historial"], label_visibility="collapsed")
     st.markdown("---")
     st.info("💡 **D3**: Tasa 10% s/ RLI\n\n💡 **D8**: Atribuido a socios")
 
@@ -164,113 +287,199 @@ with st.sidebar:
 if opcion == "Inicio":
     st.markdown('<p class="hero-title">Dashboard Global</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-hero">Estado actual de su cartera contable y auditoría automatizada.</p>', unsafe_allow_html=True)
-    
+
+    # Sprint D: datos reales desde Supabase
+    stats = db.obtener_estadisticas_inicio()
+    actividades = db.obtener_ultimas_actividades(limite=10)
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Empresas Activas", "1", "Empresa de Prueba")
+        st.metric("Cargas de Balance", str(stats.get("total_cargas", 0)), "Registros en historial")
     with col2:
-        st.metric("Revisiones Pendientes", "0", "Filtros OK")
+        st.metric("Análisis de Renta", str(stats.get("total_analisis", 0)), "Cálculos RLI")
     with col3:
-        st.metric("Eficiencia Fiscal", "94%", "+2.1% optimización")
-    
+        ultima_rli = stats.get("ultima_rli")
+        ultimo_imp = stats.get("ultimo_impuesto")
+        if ultima_rli is not None or ultimo_imp is not None:
+            st.metric(
+                "Última RLI / Impuesto",
+                f"$ {fmt_entero(ultima_rli or 0)}" if ultima_rli is not None else "—",
+                f"Impuesto $ {fmt_entero(ultimo_imp or 0)}" if ultimo_imp is not None else "",
+            )
+        else:
+            st.metric("Última RLI / Impuesto", "—", "Sin datos aún")
+
     st.markdown('<p class="section-header-god">🚀 Actividad Reciente</p>', unsafe_allow_html=True)
     with st.container(border=True):
-        st.markdown("""
-        * ✅ **Auditoría:** Balance procesado exitosamente.
-        * 🤖 **Asistente:** Informe de RLI generado.
-        * 📁 **Archivo:** Nuevo balance detectado en sistema.
-        """)
+        if not actividades:
+            st.markdown("**Aún no hay actividad.** Usá *Cargar Balance* o *Análisis de Renta* para generar registros. Si ya configuraste Supabase, los verás aquí.")
+        else:
+            ZONA_CHILE = ZoneInfo("America/Santiago")
+            for a in actividades:
+                tipo = a.get("tipo") or ""
+                fecha_raw = a.get("fecha")
+                try:
+                    if isinstance(fecha_raw, str) and "T" in fecha_raw:
+                        d = datetime.fromisoformat(fecha_raw.replace("Z", "+00:00"))
+                        if d.tzinfo is None:
+                            d = d.replace(tzinfo=timezone.utc)
+                        d_chile = d.astimezone(ZONA_CHILE)
+                        fecha_str = d_chile.strftime("%d/%m/%Y %H:%M")
+                    else:
+                        fecha_str = str(fecha_raw)[:16] if fecha_raw else "—"
+                except Exception:
+                    fecha_str = str(fecha_raw)[:16] if fecha_raw else "—"
+                desc = (a.get("descripcion") or "").strip() or "—"
+                if tipo == "carga_balance":
+                    icono = "📁"
+                    extra = ""
+                    if a.get("resultado_contable") is not None:
+                        extra = f" · Utilidad $ {fmt_entero(a['resultado_contable'])}"
+                    st.markdown(f"* **{icono} {fecha_str}** — {desc}{extra}")
+                else:
+                    icono = "🤖"
+                    rli = a.get("rli")
+                    imp = a.get("impuesto")
+                    extra = ""
+                    if rli is not None or imp is not None:
+                        extra = f" · RLI $ {fmt_entero(rli or 0)} · Impuesto $ {fmt_entero(imp or 0)}"
+                    st.markdown(f"* **{icono} {fecha_str}** — {desc}{extra}")
 
 # --- SECCIÓN 2: CARGAR BALANCE ---
 elif opcion == "Cargar Balance":
     st.markdown('<p class="hero-title">Carga de Datos</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-hero">Importación masiva de balances de 8 columnas.</p>', unsafe_allow_html=True)
-    
+    st.markdown('<p class="sub-hero">Importación masiva de balances de 8 columnas. Puedes subir varios archivos; se combinarán en un solo balance.</p>', unsafe_allow_html=True)
+
     with st.container(border=True):
-        archivo_subido = st.file_uploader("Arrastra el archivo Excel aquí", type=["xlsx"], key="carga_balance")
-    
-    if archivo_subido:
-        df = procesar_balance_8_columnas(archivo_subido)
-        if not isinstance(df, pd.DataFrame):
-            st.error(df)
+        archivos_subidos = st.file_uploader(
+            "Arrastra uno o más archivos Excel aquí",
+            type=["xlsx", "xls"],
+            key="carga_balance",
+            accept_multiple_files=True,
+        )
+
+    if archivos_subidos:
+        # SPRINT 1: Validaciones básicas de archivo (formato + contenido). No se genera balance aún.
+        error_validacion = None
+        for archivo in archivos_subidos:
+            ok_formato, msg_formato = validar_formato_archivo(archivo)
+            if not ok_formato:
+                error_validacion = msg_formato
+                break
+            ok_contenido, msg_contenido = validar_archivo_tiene_contenido(archivo)
+            if not ok_contenido:
+                error_validacion = msg_contenido
+                break
+
+        if error_validacion:
+            st.error(error_validacion)
+            solucion = get_solucion_validacion_basica(error_validacion)
+            if solucion:
+                with st.expander("¿Por qué aparece este mensaje y cómo solucionarlo?"):
+                    st.markdown(solucion)
         else:
-            df, utilidad = validar_y_calcular_resultado(df)
-            if utilidad > 0:
-                st.success(f"✅ Utilidad del Ejercicio: $ {utilidad:,.0f}")
-            elif utilidad < 0:
-                st.warning(f"⚠ Pérdida del Ejercicio: $ {abs(utilidad):,.0f}")
-            else:
-                st.success("✅ Utilidad del Ejercicio = 0")
-            # Grilla: DEBE/HABER desde DEBITOS/CREDITOS si existen, sino conservar o 0
-            df = df.copy()
-            if "DEBE" not in df.columns:
-                df["DEBE"] = df["DEBITOS"] if "DEBITOS" in df.columns else 0
-            if "HABER" not in df.columns:
-                df["HABER"] = df["CREDITOS"] if "CREDITOS" in df.columns else 0
-            columnas_orden = [
-                "CODIGO", "CUENTA", "DEBE", "HABER", "DEUDOR", "ACREEDOR", "ACTIVO", "PASIVO", "PERDIDA", "GANANCIA",
-            ]
-            cols_carga = [c for c in columnas_orden if c in df.columns]
-            df_carga = df[cols_carga].copy()
-            nombres_carga = {
-                "CODIGO": "CÓDIGO", "CUENTA": "CUENTA", "DEBE": "DEBE", "HABER": "HABER",
-                "DEUDOR": "DEUDOR", "ACREEDOR": "ACREEDOR", "ACTIVO": "ACTIVO", "PASIVO": "PASIVO",
-                "PERDIDA": "PÉRDIDA", "GANANCIA": "GANANCIA",
-            }
-            df_carga = df_carga.rename(columns={c: nombres_carga[c] for c in cols_carga if c in nombres_carga})
-            def _miles_punto(val):
-                if pd.isna(val):
-                    return ""
-                try:
-                    return f"{int(float(val)):,.0f}".replace(",", ".")
-                except (ValueError, TypeError):
-                    return str(val)
-            nums_carga = df_carga.select_dtypes(include=["number"]).columns
-            col_cod = "CÓDIGO" if "CÓDIGO" in df_carga.columns else None
-            cols_fmt = [c for c in nums_carga if c != col_cod]
-            fmt_carga = {c: _miles_punto for c in cols_fmt}
-            st.markdown(
-                "<style>div[data-testid='stDataFrame'] { padding-bottom: 12px; overflow: visible !important; }"
-                "div[data-testid='stDataFrame'] > div { border-radius: 12px; overflow: hidden; }</style>",
-                unsafe_allow_html=True,
-            )
-            # Altura según filas cargadas: 9 filas → 9 visibles, 5 filas → 5 visibles
-            n_filas_carga = len(df_carga)
-            altura_carga = 48 + 34 * n_filas_carga
-            altura_carga = max(180, min(altura_carga, 550))
-            st.dataframe(
-                df_carga.style.format(fmt_carga),
-                use_container_width=True,
-                height=int(altura_carga),
-            )
+            st.success("✅ Validación básica correcta. Los archivos cumplen con los requisitos (formato Excel y contenido válido).")
+            # Clasificación: solo mostrar "Estructura válida" cuando el archivo tiene Balance 8 columnas; si no, no desplegar mensaje.
+            estructura_valida = True
+            for archivo in archivos_subidos:
+                if hasattr(archivo, "seek"):
+                    archivo.seek(0)
+                es_valida, _, _ = validar_estructura_8_columnas(archivo)
+                if not es_valida:
+                    estructura_valida = False
+                    break
+            if estructura_valida:
+                st.info(f"📋 **Clasificación:** {ESTRUCTURA_VALIDA}")
+            # Generar grilla balance 8 columnas (con o sin estructura 8 columnas): procesar, combinar y mostrar sin validaciones adicionales.
+            lista_df = []
+            error_proceso = None
+            for archivo in archivos_subidos:
+                if hasattr(archivo, "seek"):
+                    archivo.seek(0)
+                resultado = procesar_balance_8_columnas(archivo)
+                if isinstance(resultado, str):
+                    error_proceso = resultado
+                    break
+                lista_df.append(resultado)
+            if error_proceso:
+                st.error(error_proceso)
+                with st.expander("¿Por qué aparece este mensaje y cómo solucionarlo?"):
+                    st.markdown(
+                        "**¿Por qué aparece este mensaje?** El archivo no pudo convertirse a un balance de 8 columnas. "
+                        "Puede faltar la columna de cuenta (Cuenta/Nombre), las columnas de movimientos (Debe/Haber o Débitos/Créditos o Deudor/Acreedor), "
+                        "o el archivo solo contiene filas de totales.\n\n"
+                        "**Cómo solucionarlo:** Asegúrese de que el Excel tenga al menos una hoja con columnas de cuenta y de movimientos o saldos, "
+                        "y filas de detalle (no solo totales o encabezados)."
+                    )
+            elif lista_df:
+                combined = combinar_balances(lista_df)
+                if isinstance(combined, str):
+                    st.error(combined)
+                    with st.expander("¿Por qué aparece este mensaje y cómo solucionarlo?"):
+                        st.markdown(f"**Detalle:** {combined}")
+                else:
+                    df_display = balance_8_columnas_para_display(combined)
+                    df_grilla, utilidad = validar_y_calcular_resultado(df_display.copy())
+                    df_grilla = preparar_df_para_grilla(df_grilla)
+                    df_grilla = agregar_filas_resumen_balance(df_grilla)
+                    df_show, formato_final, col_codigo_show = df_grilla_para_display(df_grilla)
+                    # Sprint C: registrar en Supabase para historial e Inicio
+                    _rc = None
+                    if utilidad is not None and utilidad == utilidad:
+                        try:
+                            _rc = int(round(utilidad))
+                        except (TypeError, ValueError):
+                            pass
+                    db.guardar_carga_balance(
+                        descripcion="Carga de balance",
+                        resultado_contable=_rc,
+                    )
+                    st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+                    st.markdown("<h3 style='margin-bottom: 0;'>📊 Grilla de Balance</h3>", unsafe_allow_html=True)
+                    html_grilla = render_grilla_agrupada(
+                        df_show, formato_final,
+                        max_height_px=int(altura_grilla(len(df_show))),
+                        codigos_rechazo=set(),
+                        col_codigo=col_codigo_show,
+                    )
+                    st.markdown(html_grilla, unsafe_allow_html=True)
+                    buffer = io.BytesIO()
+                    df_show.to_excel(buffer, index=False, engine="openpyxl")
+                    buffer.seek(0)
+                    col_dl, col_save = st.columns(2)
+                    with col_dl:
+                        st.download_button(
+                            label="📥 Descargar Excel",
+                            data=buffer.getvalue(),
+                            file_name="balance_cargado.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="download_carga_balance",
+                        )
+                    with col_save:
+                        nombre_guardar = st.text_input(
+                            "Nombre del archivo para guardar",
+                            placeholder="ej. 01 Balance Gral",
+                            key="nombre_guardar_balance",
+                        )
+                        if st.button("💾 Guardar balance", key="btn_guardar_balance"):
+                            if not (nombre_guardar or nombre_guardar.strip()):
+                                st.warning("Ingrese un nombre para el archivo.")
+                            else:
+                                # Sanitizar: espacios -> _, quitar caracteres no válidos para nombre de archivo
+                                nombre_base = re.sub(r"[\s]+", "_", nombre_guardar.strip())
+                                nombre_base = re.sub(r'[\\/:*?"<>|]', "", nombre_base) or "balance"
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                nombre_archivo = f"{nombre_base}_{timestamp}.xlsx"
+                                carpeta = os.path.join(os.path.dirname(__file__), "documentos", "balances_guardados")
+                                os.makedirs(carpeta, exist_ok=True)
+                                ruta_completa = os.path.join(carpeta, nombre_archivo)
+                                df_show.to_excel(ruta_completa, index=False, engine="openpyxl")
+                                st.success(f"✅ Balance guardado en: **{nombre_archivo}**")
 
 # --- SECCIÓN 3: ANÁLISIS DE RENTA (DISEÑO REFINADO) ---
 elif opcion == "Análisis de Renta":
     st.markdown('<p class="hero-title">Análisis de Renta Líquida Imponible</p>', unsafe_allow_html=True)
-    
-    # 1. Selección y Carga (mismo bloque, compacto y alineado)
-    st.markdown("""
-    <style>
-    /* Bloque Análisis Renta: contenedor con borde y columnas alineadas */
-    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) {
-        gap: 0.5rem;
-    }
-    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) [data-testid="column"] {
-        min-height: 88px; display: flex; flex-direction: column;
-    }
-    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stSelectbox label,
-    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stFileUploader label {
-        font-size: 0.9rem !important; font-weight: 600 !important; color: #94a3b8 !important;
-        margin-bottom: 0.35rem !important;
-    }
-    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stSelectbox [data-testid="stSelectbox"] {
-        padding: 0.35rem 0 0.5rem 0;
-    }
-    div[data-testid="stVerticalBlock"]:has(.stSelectbox):has(.stFileUploader) .stFileUploader [data-testid="stFileUploader"] section {
-        padding: 0.85rem 1.1rem !important; min-height: 68px !important; border-radius: 12px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+
     with st.container(border=True):
         col_reg, col_file = st.columns([1, 2])
         with col_reg:
@@ -278,22 +487,81 @@ elif opcion == "Análisis de Renta":
                                       ["Propyme General (14 D3)", "Propyme Transparente (14 D8)"],
                                       key="regimen_renta")
         with col_file:
-            archivo_renta = st.file_uploader("Sube el balance para el cálculo", type=["xlsx"], key="archivo_renta")
+            archivos_renta = st.file_uploader(
+                "Sube uno o más balances para el cálculo (se combinarán en uno)",
+                type=["xlsx", "xls"],
+                key="archivo_renta",
+                accept_multiple_files=True,
+            )
     
-    if archivo_renta:
-        df_renta = procesar_balance_8_columnas(archivo_renta)
-        
-        if isinstance(df_renta, pd.DataFrame):
-            resultados = calcular_rli_basica(df_renta, regimen=regimen_sel)
-            detalle_gastos = detectar_gastos_rechazados(df_renta)
+    if archivos_renta:
+        # Validaciones básicas (formato + contenido) como en Cargar Balance
+        error_validacion = None
+        for archivo in archivos_renta:
+            ok_formato, msg_formato = validar_formato_archivo(archivo)
+            if not ok_formato:
+                error_validacion = msg_formato
+                break
+            ok_contenido, msg_contenido = validar_archivo_tiene_contenido(archivo)
+            if not ok_contenido:
+                error_validacion = msg_contenido
+                break
 
-            # --- 2. TARJETAS DE MÉTRICAS (mismo tamaño, texto y valores compactos) ---
-            st.markdown("---")
-            def _card_fmt(n):
-                return f"{n:,.0f}".replace(",", ".")
-            r = resultados
-            tasa_pct = int(r["tasa_aplicada"] * 100)
-            cards_html = f"""
+        if error_validacion:
+            st.error(error_validacion)
+            solucion = get_solucion_validacion_basica(error_validacion)
+            if solucion:
+                with st.expander("¿Por qué aparece este mensaje y cómo solucionarlo?"):
+                    st.markdown(solucion)
+        else:
+            lista_df_renta = []
+            error_proceso = None
+            for archivo in archivos_renta:
+                if hasattr(archivo, "seek"):
+                    archivo.seek(0)
+                resultado = procesar_balance_8_columnas(archivo)
+                if isinstance(resultado, str):
+                    error_proceso = resultado
+                    break
+                lista_df_renta.append(resultado)
+
+            if error_proceso:
+                st.error(error_proceso)
+                with st.expander("¿Por qué aparece este mensaje y cómo solucionarlo?"):
+                    st.markdown(
+                        "**¿Por qué aparece este mensaje?** El archivo no pudo convertirse a un balance de 8 columnas. "
+                        "Puede faltar la columna de cuenta (Cuenta/Nombre), las columnas de movimientos (Debe/Haber o Débitos/Créditos o Deudor/Acreedor), "
+                        "o el archivo solo contiene filas de totales.\n\n"
+                        "**Cómo solucionarlo:** Asegúrese de que el Excel tenga al menos una hoja con columnas de cuenta y de movimientos o saldos, "
+                        "y filas de detalle (no solo totales o encabezados)."
+                    )
+            elif lista_df_renta:
+                combined_renta = combinar_balances(lista_df_renta)
+                if isinstance(combined_renta, str):
+                    st.error(combined_renta)
+                    with st.expander("¿Por qué aparece este mensaje y cómo solucionarlo?"):
+                        st.markdown(f"**Detalle:** {combined_renta}")
+                else:
+                    df_renta = balance_8_columnas_para_display(combined_renta)
+                    # Sprint 5: clasificar por plan chileno antes de RLI para que tarjetas y gráficos usen mismos datos
+                    resultados = calcular_rli_basica(df_renta, regimen=regimen_sel)
+                    detalle_gastos = detectar_gastos_rechazados(df_renta)
+
+                    # Sprint C: registrar análisis de renta en Supabase
+                    r = resultados
+                    db.guardar_analisis_renta(
+                        descripcion="Análisis de Renta",
+                        resultado_contable=int(r["resultado_contable"]) if r.get("resultado_contable") is not None else None,
+                        rli=int(r["rli_estimada"]) if r.get("rli_estimada") is not None else None,
+                        impuesto=int(r["impuesto_pagar"]) if r.get("impuesto_pagar") is not None else None,
+                        regimen=regimen_sel,
+                    )
+
+                    # --- 2. TARJETAS DE MÉTRICAS ---
+                    st.markdown("---")
+                    r = resultados
+                    tasa_pct = int(r["tasa_aplicada"] * 100)
+                    cards_html = f"""
             <style>
             .metric-cards-row {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }}
             .metric-card {{ flex: 1; min-width: 200px; min-height: 118px; padding: 16px 20px; border-radius: 16px;
@@ -306,164 +574,118 @@ elif opcion == "Análisis de Renta":
             <div class="metric-cards-row">
                 <div class="metric-card">
                     <div class="label">Utilidad Financiera</div>
-                    <div class="value">$ {_card_fmt(r['resultado_contable'])}</div>
+                    <div class="value">$ {fmt_entero(r['resultado_contable'])}</div>
                     <div class="detail">&nbsp;</div>
                 </div>
                 <div class="metric-card">
                     <div class="label">(+) Agregados (Gastos)</div>
-                    <div class="value">$ {_card_fmt(r['total_agregados'])}</div>
+                    <div class="value">$ {fmt_entero(r['total_agregados'])}</div>
                     <div class="detail" style="color:#ef4444;">↑ Gasto Rechazado</div>
                 </div>
                 <div class="metric-card">
                     <div class="label">RLI Estimada</div>
-                    <div class="value">$ {_card_fmt(r['rli_estimada'])}</div>
+                    <div class="value">$ {fmt_entero(r['rli_estimada'])}</div>
                     <div class="detail" style="color:#10b981;">↑ Base Imponible</div>
                 </div>
                 <div class="metric-card">
                     <div class="label">Impuesto IDPC</div>
-                    <div class="value">$ {_card_fmt(r['impuesto_pagar'])}</div>
+                    <div class="value">$ {fmt_entero(r['impuesto_pagar'])}</div>
                     <div class="detail" style="color:#3b82f6;">↑ Tasa {tasa_pct}%</div>
                 </div>
             </div>
             """
-            st.markdown(cards_html, unsafe_allow_html=True)
+                    st.markdown(cards_html, unsafe_allow_html=True)
 
-            # --- 3. GRÁFICOS Y ANÁLISIS ---
-            col_chart1, col_chart2 = st.columns(2)
-            with col_chart1:
-                with st.container(border=True):
-                    st.markdown("**Composición de la RLI**")
-                    datos_torta = pd.DataFrame({
-                        "Concepto": ["Utilidad", "Gastos Rechazados"],
-                        "Monto": [max(0, resultados['resultado_contable']), resultados['total_agregados']]
-                    })
-                    fig = px.pie(datos_torta, values='Monto', names='Concepto', hole=0.6,
-                                 color_discrete_sequence=['#10b981', '#ef4444'])
-                    fig.update_layout(template="plotly_dark", height=300, margin=dict(t=20, b=20, l=0, r=0))
-                    st.plotly_chart(fig, use_container_width=True)
+                    # --- 3. GRÁFICOS Y ANÁLISIS ---
+                    col_chart1, col_chart2 = st.columns(2)
+                    with col_chart1:
+                        with st.container(border=True):
+                            st.markdown("**Composición de la RLI**")
+                            datos_torta = pd.DataFrame({
+                                "Concepto": ["Utilidad", "Gastos Rechazados"],
+                                "Monto": [max(0, resultados['resultado_contable']), resultados['total_agregados']]
+                            })
+                            fig = px.pie(datos_torta, values='Monto', names='Concepto', hole=0.6,
+                                         color_discrete_sequence=['#10b981', '#ef4444'])
+                            fig.update_layout(template="plotly_dark", height=300, margin=dict(t=20, b=20, l=0, r=0))
+                            st.plotly_chart(fig, width="stretch")
 
-            with col_chart2:
-                with st.container(border=True):
-                    st.markdown("**Relación RLI vs Impuesto**")
-                    datos_bar = pd.DataFrame({
-                        "Concepto": ["RLI", "Impuesto"],
-                        "Valor": [resultados['rli_estimada'], resultados['impuesto_pagar']]
-                    })
-                    fig_bar = px.bar(datos_bar, x='Concepto', y='Valor', color='Concepto',
-                                     color_discrete_map={'RLI': '#3b82f6', 'Impuesto': '#f59e0b'})
-                    fig_bar.update_layout(template="plotly_dark", height=300, showlegend=False)
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    with col_chart2:
+                        with st.container(border=True):
+                            st.markdown("**Relación RLI vs Impuesto**")
+                            datos_bar = pd.DataFrame({
+                                "Concepto": ["RLI", "Impuesto"],
+                                "Valor": [resultados['rli_estimada'], resultados['impuesto_pagar']]
+                            })
+                            fig_bar = px.bar(datos_bar, x='Concepto', y='Valor', color='Concepto',
+                                             color_discrete_map={'RLI': '#3b82f6', 'Impuesto': '#f59e0b'})
+                            fig_bar.update_layout(template="plotly_dark", height=300, showlegend=False)
+                            st.plotly_chart(fig_bar, width="stretch")
 
-            # --- 4. CONSULTOR IA ---
-            st.markdown("### 🤖 Consultor DaddyBalance")
-            explicacion = generar_explicacion_renta(resultados, detalle_gastos)
-            st.markdown(f"<div class='ai-box-premium'>{explicacion}</div>", unsafe_allow_html=True)
+                    # --- 4. CONSULTOR IA ---
+                    st.markdown("### 🤖 Consultor DaddyBalance")
+                    explicacion = generar_explicacion_renta(resultados, detalle_gastos)
+                    st.markdown(f"<div class='ai-box-premium'>{explicacion}</div>", unsafe_allow_html=True)
 
-            # --- 5. GRILLA DE AUDITORÍA ---
-            st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
-            st.markdown("<h3 style='margin-bottom: 0;'>📊 Grilla de Auditoría</h3>", unsafe_allow_html=True)
-            # 1. Validar igualdad Debe/Haber (balance de comprobación)
-            cuadra_debe_haber, suma_debe, suma_haber = validar_debe_haber_cuadra(df_renta)
-            if not cuadra_debe_haber:
-                st.error(
-                    f"⚠️ Balance de comprobación no cuadra: Suma DEBE = $ {suma_debe:,.0f} | "
-                    f"Suma HABER = $ {suma_haber:,.0f}"
-                )
-            # 2. Clasificar (activo=deudor 1xx, pasivo=acreedor 2xx/3xx, perdida=deudor 4/5, ganancia=acreedor 6/7/8)
-            # 3. Calcular utilidad y agregar fila resultado
-            df_grilla = balance_8_columnas_para_display(df_renta.copy())
-            df_grilla, _ = validar_y_calcular_resultado(df_grilla)
-            # DEBE/HABER = movimientos; usar DEBITOS/CREDITOS si existen, sino DEBE/HABER del Excel, sino 0
-            if "DEBE" not in df_grilla.columns:
-                df_grilla["DEBE"] = df_grilla["DEBITOS"] if "DEBITOS" in df_grilla.columns else 0
-            if "HABER" not in df_grilla.columns:
-                df_grilla["HABER"] = df_grilla["CREDITOS"] if "CREDITOS" in df_grilla.columns else 0
-            # Orden y conjunto de columnas: CÓDIGO, CUENTA, DEBE, HABER, DEUDOR, ACREEDOR, ACTIVO, PASIVO, PÉRDIDA, GANANCIA
-            columnas_grilla_orden = [
-                "CODIGO", "CUENTA", "DEBE", "HABER", "DEUDOR", "ACREEDOR", "ACTIVO", "PASIVO", "PERDIDA", "GANANCIA",
-            ]
-            columnas_grilla = [c for c in columnas_grilla_orden if c in df_grilla.columns]
-            df_grilla = df_grilla[columnas_grilla].copy()
-            # Encabezados tal como solicitado (PÉRDIDA con tilde)
-            nombres_grilla = {
-                "CODIGO": "CÓDIGO", "CUENTA": "CUENTA", "DEBE": "DEBE", "HABER": "HABER",
-                "DEUDOR": "DEUDOR", "ACREEDOR": "ACREEDOR", "ACTIVO": "ACTIVO", "PASIVO": "PASIVO",
-                "PERDIDA": "PÉRDIDA", "GANANCIA": "GANANCIA",
-            }
-            renombrar = {c: nombres_grilla[c] for c in columnas_grilla if c in nombres_grilla}
-            df_show = df_grilla.rename(columns=renombrar)
-            # Formato: miles con punto (ej. 4.906.708), sin símbolo $
-            def formatear_miles_punto(val):
-                if pd.isna(val):
-                    return ""
-                try:
-                    return f"{int(float(val)):,.0f}".replace(",", ".")
-                except (ValueError, TypeError):
-                    return str(val)
-            columnas_numericas_show = df_show.select_dtypes(include=["number"]).columns
-            col_codigo_show = "CÓDIGO" if "CÓDIGO" in df_show.columns else None
-            columnas_moneda_show = [c for c in columnas_numericas_show if c != col_codigo_show]
-            formato_final = {c: formatear_miles_punto for c in columnas_moneda_show}
+                    # --- 5. GRILLA DE AUDITORÍA ---
+                    st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
+                    st.markdown("<h3 style='margin-bottom: 0;'>📊 Grilla de Auditoría</h3>", unsafe_allow_html=True)
+                    mostrar_validacion_debe_haber(df_renta, validar_debe_haber_cuadra, prefijo="$ ")
+                    df_grilla, _ = validar_y_calcular_resultado(df_renta.copy())
+                    df_grilla = preparar_df_para_grilla(df_grilla)
+                    df_grilla = agregar_filas_resumen_balance(df_grilla)
+                    df_show, formato_final, col_codigo_show = df_grilla_para_display(df_grilla)
 
-            codigos_rechazo = set()
-            if detalle_gastos is not None and not detalle_gastos.empty:
-                col_codigo_dg = _nombre_columna_codigo(detalle_gastos.columns)
-                if col_codigo_dg:
-                    codigos_rechazo = set(str(c) for c in detalle_gastos[col_codigo_dg].dropna())
+                    codigos_rechazo = set()
+                    if detalle_gastos is not None and not detalle_gastos.empty:
+                        col_codigo_dg = _nombre_columna_codigo(detalle_gastos.columns)
+                        if col_codigo_dg:
+                            codigos_rechazo = set(str(c) for c in detalle_gastos[col_codigo_dg].dropna())
 
-            def highlight_gr(row):
-                val_codigo = str(row.get(col_codigo_show, "")) if col_codigo_show else ""
-                if val_codigo in codigos_rechazo and val_codigo:
-                    return ["background-color: rgba(239, 68, 68, 0.1); border-left: 4px solid #ef4444;"] * len(row)
-                return [""] * len(row)
+                    html_grilla = render_grilla_agrupada(
+                        df_show, formato_final,
+                        max_height_px=int(altura_grilla(len(df_show))),
+                        codigos_rechazo=codigos_rechazo,
+                        col_codigo=col_codigo_show,
+                    )
+                    st.markdown(html_grilla, unsafe_allow_html=True)
+                    st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+                    mostrar_validacion_activo_pasivo(df_grilla, validar_activo_igual_pasivo, prefijo="$ ", titulo_error="Balance 8 columnas descuadrado")
+                    # Botón de descarga Excel debajo de la grilla
+                    buffer = io.BytesIO()
+                    df_show.to_excel(buffer, index=False, engine="openpyxl")
+                    buffer.seek(0)
+                    st.download_button(
+                        label="📥 Descargar Excel",
+                        data=buffer,
+                        file_name="grilla_auditoria.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
-            st.markdown(
-                "<style>div[data-testid='stDataFrame'] { padding-bottom: 20px !important; margin-bottom: 8px; margin-top: -8px !important; }</style>",
-                unsafe_allow_html=True,
-            )
-            # Altura exacta: dibujar solo las filas cargadas (9 filas → 9 filas visibles, 5 → 5)
-            n_filas = len(df_show)
-            alto_cabecera = 48
-            alto_por_fila = 34
-            altura_grilla = alto_cabecera + alto_por_fila * n_filas
-            altura_grilla = max(180, min(altura_grilla, 550))  # mínimo 180px; si muchas filas, scroll desde ~15
-            st.dataframe(
-                df_show.style.apply(highlight_gr, axis=1).format(formato_final),
-                use_container_width=True,
-                height=int(altura_grilla),
-            )
-            # 6. Validar balance final: sum(activo) == sum(pasivo)
-            suma_activo, suma_pasivo, cuadra_balance = validar_activo_igual_pasivo(df_grilla)
-            if cuadra_balance:
-                st.success(f"✅ Balance correcto (Activo = Pasivo: $ {suma_activo:,.0f})")
-            else:
-                st.error(
-                    f"⚠️ Balance 8 columnas descuadrado: Suma ACTIVO = $ {suma_activo:,.0f} | "
-                    f"Suma PASIVO = $ {suma_pasivo:,.0f} | Diferencia = $ {abs(suma_activo - suma_pasivo):,.0f}"
-                )
-            # Botón de descarga Excel debajo de la grilla
-            buffer = io.BytesIO()
-            df_show.to_excel(buffer, index=False, engine="openpyxl")
-            buffer.seek(0)
-            st.download_button(
-                label="📥 Descargar Excel",
-                data=buffer,
-                file_name="grilla_auditoria.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                    # Nota: cómo se calcula todo (con datos reales de la grilla)
+                    # Importante: df_grilla aquí incluye SUBTOTALES/TOTALES (solo display). Para cálculos reales, excluirlas.
+                    # Además, la fila "Utilidad/Pérdida del Ejercicio" es un asiento de cierre (cuadra ER),
+                    # por lo que para mostrar Ganancias - Pérdidas se debe excluir esa fila.
+                    df_grilla_val = df_grilla
+                    if "CUENTA" in df_grilla.columns:
+                        _s = df_grilla["CUENTA"].astype(str).str.strip().str.upper()
+                        df_grilla_val = df_grilla[~_s.isin({"SUBTOTALES", "TOTALES"})]
 
-            # Nota: cómo se calcula todo (con datos reales de la grilla)
-            total_debe_n = int(df_grilla["DEBE"].sum()) if "DEBE" in df_grilla.columns else 0
-            total_haber_n = int(df_grilla["HABER"].sum()) if "HABER" in df_grilla.columns else 0
-            total_ganancia_n = int(df_grilla["GANANCIA"].sum()) if "GANANCIA" in df_grilla.columns else 0
-            total_perdida_n = int(df_grilla["PERDIDA"].sum()) if "PERDIDA" in df_grilla.columns else 0
-            utilidad_n = total_ganancia_n - total_perdida_n
+                    df_grilla_pre_cierre = df_grilla_val
+                    if "CUENTA" in df_grilla_val.columns:
+                        _t = df_grilla_val["CUENTA"].astype(str).str.strip().str.upper()
+                        df_grilla_pre_cierre = df_grilla_val[~_t.str.contains("UTILIDAD DEL EJERCICIO|PERDIDA DEL EJERCICIO", na=False)]
 
-            def _fmt(n):
-                return f"{n:,}".replace(",", ".")
+                    total_debe_n = int(df_grilla_pre_cierre["DEBE"].sum()) if "DEBE" in df_grilla_pre_cierre.columns else 0
+                    total_haber_n = int(df_grilla_pre_cierre["HABER"].sum()) if "HABER" in df_grilla_pre_cierre.columns else 0
+                    total_ganancia_n = int(df_grilla_pre_cierre["GANANCIA"].sum()) if "GANANCIA" in df_grilla_pre_cierre.columns else 0
+                    total_perdida_n = int(df_grilla_pre_cierre["PERDIDA"].sum()) if "PERDIDA" in df_grilla_pre_cierre.columns else 0
+                    utilidad_n = total_ganancia_n - total_perdida_n
+                    cuadra_debe_haber, _, _ = validar_debe_haber_cuadra(df_renta)
+                    suma_activo, suma_pasivo, cuadra_balance = validar_activo_igual_pasivo(df_grilla_val)
 
-            st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
-            nota_html = f"""
+                    st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
+                    nota_html = f"""
             <div style="
                 background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
                 border: 1px solid rgba(255,255,255,0.08);
@@ -478,34 +700,122 @@ elif opcion == "Análisis de Renta":
                     <div style="background: rgba(30,41,59,0.6); border-radius: 12px; padding: 16px 20px; border-left: 4px solid #3b82f6;">
                         <div style="font-weight: 700; margin-bottom: 8px;">1️⃣ Validación de sumas</div>
                         <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;">
-                            <span>Total Debe <strong style="color: #fff;">{_fmt(total_debe_n)}</strong></span>
+                            <span>Total Debe <strong style="color: #fff;">{fmt_entero(total_debe_n)}</strong></span>
                             <span style="color: #64748b;">|</span>
-                            <span>Total Haber <strong style="color: #fff;">{_fmt(total_haber_n)}</strong></span>
+                            <span>Total Haber <strong style="color: #fff;">{fmt_entero(total_haber_n)}</strong></span>
                             <span style="margin-left: 8px;">{'✔ Debe = Haber' if cuadra_debe_haber else '✘ No cuadra'}</span>
                         </div>
                     </div>
                     <div style="background: rgba(30,41,59,0.6); border-radius: 12px; padding: 16px 20px; border-left: 4px solid #10b981;">
                         <div style="font-weight: 700; margin-bottom: 8px;">2️⃣ Cálculo de utilidad</div>
                         <div style="color: #94a3b8; font-size: 0.95rem;">
-                            Ganancias: <strong style="color: #10b981;">{_fmt(total_ganancia_n)}</strong> &nbsp;&nbsp;−&nbsp;&nbsp;
-                            Pérdidas: <strong style="color: #f59e0b;">{_fmt(total_perdida_n)}</strong>
-                            &nbsp;&nbsp;=&nbsp;&nbsp; Utilidad: <strong style="color: #fff;">{_fmt(utilidad_n)}</strong>
+                            Ganancias: <strong style="color: #10b981;">{fmt_entero(total_ganancia_n)}</strong> &nbsp;&nbsp;−&nbsp;&nbsp;
+                            Pérdidas: <strong style="color: #f59e0b;">{fmt_entero(total_perdida_n)}</strong>
+                            &nbsp;&nbsp;=&nbsp;&nbsp; Utilidad: <strong style="color: #fff;">{fmt_entero(utilidad_n)}</strong>
                         </div>
                         <div style="margin-top: 6px;">✔ Correcta.</div>
                     </div>
                     <div style="background: rgba(30,41,59,0.6); border-radius: 12px; padding: 16px 20px; border-left: 4px solid #8b5cf6;">
                         <div style="font-weight: 700; margin-bottom: 8px;">3️⃣ Validación balance final</div>
                         <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;">
-                            <span>Activo: <strong style="color: #fff;">{_fmt(suma_activo)}</strong></span>
+                            <span>Activo: <strong style="color: #fff;">{fmt_entero(suma_activo)}</strong></span>
                             <span style="color: #64748b;">|</span>
-                            <span>Pasivo: <strong style="color: #fff;">{_fmt(suma_pasivo)}</strong></span>
+                            <span>Pasivo: <strong style="color: #fff;">{fmt_entero(suma_pasivo)}</strong></span>
                             <span style="margin-left: 8px;">{'✔ Activo = Pasivo' if cuadra_balance else '✘ Descuadrado'}</span>
                         </div>
                     </div>
                 </div>
             </div>
             """
-            st.markdown(nota_html, unsafe_allow_html=True)
+                    st.markdown(nota_html, unsafe_allow_html=True)
+
+# --- SECCIÓN 4: VER HISTORIAL (Sprint E) ---
+elif opcion == "Ver historial":
+    st.markdown('<p class="hero-title">Ver historial</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-hero">Consulta todas las cargas de balance y análisis de renta registrados.</p>', unsafe_allow_html=True)
+
+    actividades_h = db.obtener_ultimas_actividades(limite=1)
+    if not actividades_h:
+        st.info("No hay historial aún. Conectá Supabase y usá *Cargar Balance* o *Análisis de Renta* para generar registros.")
+    else:
+        with st.container(border=True):
+            col_tipo, col_desde, col_hasta = st.columns(3)
+            with col_tipo:
+                filtro_tipo = st.selectbox(
+                    "Tipo",
+                    ["Todos", "Carga de balance", "Análisis de Renta"],
+                    key="historial_tipo",
+                )
+            with col_desde:
+                filtro_desde = st.date_input("Desde", value=None, key="historial_desde")
+            with col_hasta:
+                filtro_hasta = st.date_input("Hasta", value=None, key="historial_hasta")
+
+        tipo_val = None
+        if filtro_tipo == "Carga de balance":
+            tipo_val = "carga_balance"
+        elif filtro_tipo == "Análisis de Renta":
+            tipo_val = "analisis_renta"
+
+        fecha_desde_str = None
+        fecha_hasta_str = None
+        if filtro_desde:
+            fecha_desde_str = filtro_desde.isoformat() + "T00:00:00Z"
+        if filtro_hasta:
+            fecha_hasta_str = filtro_hasta.isoformat() + "T23:59:59Z"
+
+        lista_h = db.obtener_actividades_filtradas(
+            tipo=tipo_val,
+            fecha_desde=fecha_desde_str,
+            fecha_hasta=fecha_hasta_str,
+            limite=500,
+        )
+
+        if not lista_h:
+            st.warning("No hay registros con los filtros elegidos.")
+        else:
+            ZONA_CHILE_H = ZoneInfo("America/Santiago")
+            filas = []
+            for a in lista_h:
+                fecha_raw = a.get("fecha")
+                try:
+                    if isinstance(fecha_raw, str) and "T" in fecha_raw:
+                        d = datetime.fromisoformat(fecha_raw.replace("Z", "+00:00"))
+                        if d.tzinfo is None:
+                            d = d.replace(tzinfo=timezone.utc)
+                        fecha_str = d.astimezone(ZONA_CHILE_H).strftime("%d/%m/%Y %H:%M")
+                    else:
+                        fecha_str = str(fecha_raw)[:16] if fecha_raw else "—"
+                except Exception:
+                    fecha_str = str(fecha_raw)[:16] if fecha_raw else "—"
+                tipo_label = "Carga" if a.get("tipo") == "carga_balance" else "Análisis Renta"
+                desc = (a.get("descripcion") or "—").strip() or "—"
+                rc = a.get("resultado_contable")
+                rli = a.get("rli")
+                imp = a.get("impuesto")
+                regimen = (a.get("regimen") or "—").strip() or "—"
+                filas.append({
+                    "Fecha": fecha_str,
+                    "Tipo": tipo_label,
+                    "Descripción": desc,
+                    "Resultado": fmt_entero(rc) if rc is not None else "—",
+                    "RLI": fmt_entero(rli) if rli is not None else "—",
+                    "Impuesto": fmt_entero(imp) if imp is not None else "—",
+                    "Régimen": regimen,
+                })
+            df_hist = pd.DataFrame(filas)
+            st.dataframe(df_hist, use_container_width=True, height=min(400, 50 + 35 * len(filas)))
+            buf_csv = io.StringIO()
+            df_hist.to_csv(buf_csv, index=False, sep=";", decimal=",")
+            buf_csv.seek(0)
+            st.download_button(
+                label="📥 Exportar CSV",
+                data=buf_csv.getvalue(),
+                file_name="historial_actividad.csv",
+                mime="text/csv",
+                key="download_historial",
+            )
+
 
 
 
