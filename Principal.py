@@ -57,9 +57,11 @@ def check_password():
         return False
 
     def password_entered():
-        if st.session_state["password"] == str(password_esperada).strip():
+        p = st.session_state.get("password", "")
+        if p == str(password_esperada).strip():
             st.session_state["password_correct"] = True
-            del st.session_state["password"]
+            if "password" in st.session_state:
+                del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
