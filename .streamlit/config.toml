@@ -1,0 +1,13 @@
+# Tema fijo para que DaddyBalance se vea igual en todos los entornos (dark)
+[theme]
+base = "dark"
+primaryColor = "#3b82f6"
+backgroundColor = "#0b0e14"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#f8fafc"
+font = "sans serif"
+
+[server]
+headless = true
+# Evita ValueError "Paths don't have the same drive" en Windows (watchdog)
+fileWatcherType = "none"
