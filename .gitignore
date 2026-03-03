@@ -1,0 +1,14 @@
+# Contraseñas y API keys (nunca subir a un repo)
+.streamlit/secrets.toml
+
+# Entorno virtual
+entorno_DaddyBalance/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
